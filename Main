@@ -1,3 +1,108 @@
-mkdir repo-agent && cd repo-agent
-npm init -y
-npm install simple-git fs-extra axios execa
+mkdi
+require("dotenv").config();
+const simpleGit = require("simple-git");
+const fs = require("fs-extra");
+const path = require("path");
+const axios = require("axios");
+const { execa } = require("execa");
+
+const TMP = path.join(__dirname, "workspace");
+
+async function createRepo(name) {
+  const res = await axios.post(
+    "https://api.github.com/user/repos",
+    { name, private: false },
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+        Accept: "application/vnd.github+json"
+      }
+    }
+  );
+  return res.data.clone_url;
+}
+
+async function analyze(repoPath) {
+  const files = await fs.readdir(repoPath);
+  const issues = [];
+
+  if (!files.includes("README.md")) issues.push("Missing README");
+  if (!files.includes(".gitignore")) issues.push("Missing .gitignore");
+  if (!files.includes("package.json") && !files.includes("requirements.txt")) {
+    issues.push("No dependency manifest");
+  }
+
+  return { files, issues };
+}
+
+async function fix(repoPath, files) {
+  if (!files.includes("README.md")) {
+    await fs.writeFile(path.join(repoPath, "README.md"), "# Auto Project");
+  }
+
+  if (!files.includes(".gitignore")) {
+    await fs.writeFile(path.join(repoPath, ".gitignore"), "node_modules\n.env\n");
+  }
+}
+
+async function setupCI(repoPath) {
+  const workflowDir = path.join(repoPath, ".github/workflows");
+  await fs.ensureDir(workflowDir);
+
+  const ci = `
+name: CI
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - run: npm install || true
+      - run: npm test || true
+`;
+
+  await fs.writeFile(path.join(workflowDir, "ci.yml"), ci);
+}
+
+async function installAndBuild(repoPath) {
+  if (await fs.pathExists(path.join(repoPath, "package.json"))) {
+    await execa("npm", ["install"], { cwd: repoPath });
+    await execa("npm", ["run", "build"], { cwd: repoPath }).catch(() => {});
+  }
+}
+
+async function run(repoUrl, newName) {
+  await fs.remove(TMP);
+
+  let targetRepo = repoUrl;
+
+  if (!targetRepo) {
+    targetRepo = await createRepo(newName);
+  }
+
+  const git = simpleGit();
+  await git.clone(targetRepo, TMP);
+
+  const repoGit = simpleGit(TMP);
+
+  const { files, issues } = await analyze(TMP);
+
+  await fix(TMP, files);
+  await setupCI(TMP);
+  await installAndBuild(TMP);
+
+  await repoGit.add(".");
+  await repoGit.commit("auto: full build + fixes + CI");
+
+  await repoGit.push("origin", "main");
+
+  return { repo: targetRepo, issues };
+}
+
+// CLI usage
+const repoUrl = process.argv[2];
+const newName = process.argv[3] || "auto-launch-repo";
+
+run(repoUrl, newName)
+  .then(res => console.log(res))
+  .catch(err => console.error(err));
