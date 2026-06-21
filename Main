@@ -70,7 +70,95 @@ async function installAndBuild(repoPath) {
   }
 }
 
-async function run(repoUrl, newName) {
+// Resolves the LLM endpoint configuration. Defaults to Hugging Face's
+// Inference Providers router with an open-weights coding model. The endpoint
+// speaks the OpenAI-compatible wire format, so it also works with any
+// open/self-hosted OpenAI-compatible server (e.g. a local Ollama instance)
+// by overriding LLM_BASE_URL / LLM_MODEL. No OpenAI or Anthropic service.
+function getLLMConfig() {
+  const apiKey = process.env.HF_TOKEN || process.env.HUGGINGFACE_API_KEY;
+  const baseURL = process.env.LLM_BASE_URL || "https://router.huggingface.co/v1";
+  const model = process.env.LLM_MODEL || "Qwen/Qwen2.5-Coder-32B-Instruct";
+  return { apiKey, baseURL, model };
+}
+
+// Extracts a list of { path, content } files from a model response, tolerating
+// responses that wrap the JSON in markdown code fences.
+function parseFilesFromModel(raw) {
+  let text = String(raw || "").trim();
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) text = fence[1].trim();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (err) {
+    return [];
+  }
+
+  const files = Array.isArray(data) ? data : data.files;
+  if (!Array.isArray(files)) return [];
+
+  return files.filter(
+    (f) => f && typeof f.path === "string" && typeof f.content === "string"
+  );
+}
+
+// Uses an LLM to implement a natural-language task as real code files, written
+// into the cloned repo. No-op (returns a reason) when no task or token is set.
+async function generateCode(repoPath, task) {
+  if (!task) return { generated: [], skipped: "no task provided" };
+
+  const { apiKey, baseURL, model } = getLLMConfig();
+  if (!apiKey) {
+    return { generated: [], skipped: "no LLM token (set HF_TOKEN)" };
+  }
+
+  const system =
+    "You are a senior software engineer. Implement the user's task as " +
+    "production-quality, working code. Respond with ONLY a JSON object of the " +
+    'form {"files":[{"path":"relative/path","content":"full file contents"}]} ' +
+    "and no commentary. Use relative paths only; never absolute paths or '..'.";
+
+  const res = await axios.post(
+    `${baseURL}/chat/completions`,
+    {
+      model,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: `Task: ${task}` }
+      ],
+      temperature: 0.2,
+      response_format: { type: "json_object" }
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      timeout: 120000
+    }
+  );
+
+  const raw = res.data?.choices?.[0]?.message?.content || "";
+  const files = parseFilesFromModel(raw);
+
+  const repoRoot = path.resolve(repoPath);
+  const generated = [];
+  for (const file of files) {
+    const dest = path.resolve(repoRoot, file.path);
+    // Guard against path traversal: keep writes inside the repo.
+    if (dest !== repoRoot && !dest.startsWith(repoRoot + path.sep)) continue;
+
+    await fs.ensureDir(path.dirname(dest));
+    await fs.writeFile(dest, file.content);
+    generated.push(path.relative(repoRoot, dest));
+  }
+
+  return { generated, model };
+}
+
+async function run(repoUrl, newName, task) {
   await fs.remove(TMP);
 
   let targetRepo = repoUrl;
@@ -88,20 +176,35 @@ async function run(repoUrl, newName) {
 
   await fix(TMP, files);
   await setupCI(TMP);
+
+  const codegen = await generateCode(TMP, task);
+
   await installAndBuild(TMP);
 
   await repoGit.add(".");
   await repoGit.commit("auto: full build + fixes + CI");
 
-  await repoGit.push("origin", "main");
+  // Pushing can fail for reasons outside the agent's control (auth, protected
+  // branches, network). Don't discard the rest of the run if it does.
+  let pushed = false;
+  let pushError = null;
+  try {
+    await repoGit.push("origin", "main");
+    pushed = true;
+  } catch (err) {
+    pushError = err.message;
+  }
 
-  return { repo: targetRepo, issues };
+  return { repo: targetRepo, issues, codegen, pushed, pushError };
 }
 
-// CLI usage
+// CLI usage:
+//   node Main [repoUrl] [newName] [task]
+// The code-generation task may also be supplied via the CODE_TASK env var.
 const repoUrl = process.argv[2];
 const newName = process.argv[3] || "auto-launch-repo";
+const task = process.argv[4] || process.env.CODE_TASK;
 
-run(repoUrl, newName)
+run(repoUrl, newName, task)
   .then(res => console.log(res))
   .catch(err => console.error(err));
