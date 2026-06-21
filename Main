@@ -1,4 +1,3 @@
-mkdi
 require("dotenv").config();
 const simpleGit = require("simple-git");
 const fs = require("fs-extra");
@@ -11,7 +10,7 @@ const TMP = path.join(__dirname, "workspace");
 async function createRepo(name) {
   const res = await axios.post(
     "https://api.github.com/user/repos",
-    { name, private: false },
+    { name, private: true },
     {
       headers: {
         Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
